@@ -48,6 +48,10 @@ pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+const TAMU_AI_CHAT_PROVIDER_NAME: &str = "TAMU AI Chat";
+const TAMU_AI_CHAT_BASE_URL: &str = "https://chat-api.tamu.ai/openai";
+const TAMU_AI_CHAT_API_KEY_ENV: &str = "TAMUS_AI_CHAT_API_KEY";
+pub const TAMU_AI_CHAT_PROVIDER_ID: &str = "tamu-ai-chat";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
@@ -58,12 +62,16 @@ pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     #[default]
     Responses,
+    /// TAMU AI Chat's Chat Completions-compatible API.
+    #[serde(rename = "tamu_chat")]
+    TamuChat,
 }
 
 impl fmt::Display for WireApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Responses => "responses",
+            Self::TamuChat => "tamu_chat",
         };
         f.write_str(value)
     }
@@ -77,8 +85,12 @@ impl<'de> Deserialize<'de> for WireApi {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "responses" => Ok(Self::Responses),
+            "tamu_chat" => Ok(Self::TamuChat),
             "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["responses", "tamu_chat"],
+            )),
         }
     }
 }
@@ -393,6 +405,30 @@ impl ModelProviderInfo {
         }
     }
 
+    pub fn create_tamu_ai_chat_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: TAMU_AI_CHAT_PROVIDER_NAME.into(),
+            base_url: Some(TAMU_AI_CHAT_BASE_URL.into()),
+            env_key: Some(TAMU_AI_CHAT_API_KEY_ENV.into()),
+            env_key_instructions: Some(format!(
+                "Set {TAMU_AI_CHAT_API_KEY_ENV} to your TAMU AI Chat API key."
+            )),
+            experimental_bearer_token: None,
+            auth: None,
+            aws: None,
+            wire_api: WireApi::TamuChat,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        }
+    }
+
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
@@ -433,14 +469,14 @@ pub fn built_in_model_providers(
     use ModelProviderInfo as P;
     let openai_provider = P::create_openai_provider(openai_base_url);
     let amazon_bedrock_provider = P::create_amazon_bedrock_provider(/*aws*/ None);
+    let tamu_ai_chat_provider = P::create_tamu_ai_chat_provider();
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // This fork adds TAMU AI Chat alongside the upstream OpenAI, Amazon Bedrock, and local OSS
+    // providers so users only need to select the provider and model in config.toml.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
+        (TAMU_AI_CHAT_PROVIDER_ID, tamu_ai_chat_provider),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),

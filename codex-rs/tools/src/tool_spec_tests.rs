@@ -9,6 +9,7 @@ use crate::JsonSchema;
 use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
 use crate::create_tools_json_for_responses_api;
+use crate::create_tools_json_for_tamu_chat_api;
 use codex_protocol::config_types::WebSearchContextSize;
 use codex_protocol::config_types::WebSearchFilters as ConfigWebSearchFilters;
 use codex_protocol::config_types::WebSearchUserLocation as ConfigWebSearchUserLocation;
@@ -260,5 +261,41 @@ fn tool_search_tool_spec_serializes_expected_wire_shape() {
                 "additionalProperties": false,
             },
         })
+    );
+}
+
+#[test]
+fn tamu_chat_serializes_only_function_tools() {
+    let function = ToolSpec::Function(ResponsesApiTool {
+        name: "demo".to_string(),
+        description: "Run a demo".to_string(),
+        strict: false,
+        defer_loading: Some(true),
+        parameters: JsonSchema::object(BTreeMap::new(), None, None),
+        output_schema: None,
+    });
+    let hosted = ToolSpec::WebSearch {
+        external_web_access: None,
+        indexed_web_access: None,
+        filters: None,
+        user_location: None,
+        search_context_size: None,
+        search_content_types: None,
+    };
+
+    assert_eq!(
+        create_tools_json_for_tamu_chat_api(&[function, hosted]).unwrap(),
+        vec![json!({
+            "type": "function",
+            "function": {
+                "name": "demo",
+                "description": "Run a demo",
+                "strict": false,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        })]
     );
 }

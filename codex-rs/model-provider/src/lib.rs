@@ -3,6 +3,7 @@ mod auth;
 mod bearer_auth_provider;
 mod models_endpoint;
 mod provider;
+mod tamu_ai_chat;
 
 pub use auth::AgentIdentitySessionFallback;
 pub use auth::ProviderAuthScope;

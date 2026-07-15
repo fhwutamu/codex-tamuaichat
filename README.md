@@ -9,6 +9,27 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
+## TAMU AI Chat fork
+
+This fork keeps Codex's agent loop and function tools while using TAMU AI Chat. Export your key, then configure `~/.codex/config.toml`:
+
+```shell
+export TAMUS_AI_CHAT_API_KEY="your-api-key"
+```
+
+```toml
+model_provider = "tamu-ai-chat"
+model = "gpt-5.4"
+```
+
+```shell
+cd codex-rs
+cargo run -p codex-cli --bin codex
+```
+
+The provider calls TAMU's Chat Completions endpoint, adds its required `protected.` model prefix, and supports function-calling models.
+It does not expose Responses-only hosted, namespace, or freeform tools, structured output schemas, or Responses WebSockets.
+
 ## Quickstart
 
 ### Installing and running Codex CLI

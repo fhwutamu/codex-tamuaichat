@@ -8,6 +8,7 @@ pub(crate) mod responses;
 pub(crate) mod responses_websocket;
 pub(crate) mod search;
 mod session;
+pub(crate) mod tamu_chat;
 
 pub use compact::CompactClient;
 pub use images::ImagesClient;
@@ -31,3 +32,4 @@ pub use responses_websocket::ResponsesWebsocketClose;
 pub use responses_websocket::ResponsesWebsocketConnection;
 pub use responses_websocket::ResponsesWebsocketProbe;
 pub use search::SearchClient;
+pub use tamu_chat::TamuChatClient;
