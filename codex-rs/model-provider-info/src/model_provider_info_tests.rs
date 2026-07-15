@@ -120,6 +120,31 @@ wire_api = "chat"
 }
 
 #[test]
+fn test_deserialize_tamu_chat_wire_api() {
+    let provider: ModelProviderInfo = toml::from_str(
+        r#"
+name = "TAMU AI Chat"
+base_url = "https://chat-api.tamu.ai/openai"
+env_key = "TAMUS_AI_CHAT_API_KEY"
+wire_api = "tamu_chat"
+        "#,
+    )
+    .unwrap();
+
+    assert_eq!(provider.wire_api, WireApi::TamuChat);
+}
+
+#[test]
+fn test_built_in_tamu_ai_chat_provider() {
+    let providers = built_in_model_providers(/*openai_base_url*/ None);
+    let provider = providers
+        .get(TAMU_AI_CHAT_PROVIDER_ID)
+        .expect("TAMU provider should be built in");
+
+    assert_eq!(provider, &ModelProviderInfo::create_tamu_ai_chat_provider());
+}
+
+#[test]
 fn test_deserialize_websocket_connect_timeout() {
     let provider_toml = r#"
 name = "OpenAI"

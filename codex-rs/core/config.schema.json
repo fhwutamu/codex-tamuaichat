@@ -4604,6 +4604,13 @@
             "responses"
           ],
           "type": "string"
+        },
+        {
+          "description": "TAMU AI Chat's Chat Completions-compatible API.",
+          "enum": [
+            "tamu_chat"
+          ],
+          "type": "string"
         }
       ]
     },

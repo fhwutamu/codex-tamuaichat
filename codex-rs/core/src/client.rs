@@ -57,6 +57,9 @@ use codex_api::ResponsesWsRequest;
 use codex_api::SharedAuthProvider;
 use codex_api::SseTelemetry;
 use codex_api::StreamOptions;
+use codex_api::TamuChatClient as ApiTamuChatClient;
+use codex_api::TamuChatRequest;
+use codex_api::TamuChatRequestBuilder;
 use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
 use codex_api::auth_header_telemetry;
@@ -88,6 +91,7 @@ use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
 use codex_tools::create_tools_json_for_responses_api;
+use codex_tools::create_tools_json_for_tamu_chat_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
@@ -157,6 +161,7 @@ const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
 const REALTIME_CALLS_ENDPOINT: &str = "/realtime/calls";
 const RESPONSES_ENDPOINT: &str = "/responses";
 const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
+const TAMU_CHAT_COMPLETIONS_ENDPOINT: &str = "/chat/completions";
 // `/responses/compact` is unary, so the timeout covers the full response rather than one idle
 // period between stream events.
 const COMPACT_REQUEST_TIMEOUT_IDLE_MULTIPLIER: u32 = 4;
@@ -907,6 +912,28 @@ impl ModelClient {
         Ok(request)
     }
 
+    fn build_tamu_chat_request(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+    ) -> Result<TamuChatRequest> {
+        if prompt.output_schema.is_some() {
+            return Err(CodexErr::UnsupportedOperation(
+                "output_schema is not supported by TAMU AI Chat".to_string(),
+            ));
+        }
+
+        let tools = create_tools_json_for_tamu_chat_api(&prompt.tools)?;
+        Ok(TamuChatRequestBuilder::new(
+            &model_info.slug,
+            &prompt.base_instructions.text,
+            &prompt.input,
+            &tools,
+        )
+        .parallel_tool_calls(prompt.parallel_tool_calls)
+        .build())
+    }
+
     fn prepare_response_items_for_request(&self, input: &mut [ResponseItem], store: bool) {
         for item in input.iter_mut() {
             if item.id().is_some_and(|id| !id.is_prefixed()) {
@@ -1505,6 +1532,89 @@ impl ModelClientSession {
         }
     }
 
+    /// Streams a turn through TAMU AI Chat's Chat Completions-compatible endpoint.
+    async fn stream_tamu_chat(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        let request = self.client.build_tamu_chat_request(prompt, model_info)?;
+        let auth_manager = self.client.state.provider.auth_manager();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = self
+                .client
+                .build_api_transport(&client_setup.api_provider, TAMU_CHAT_COMPLETIONS_ENDPOINT)?;
+            let auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                pending_retry,
+            );
+            let (request_telemetry, _sse_telemetry) = Self::build_streaming_telemetry(
+                session_telemetry,
+                auth_context,
+                RequestRouteTelemetry::for_endpoint(TAMU_CHAT_COMPLETIONS_ENDPOINT),
+                self.client.state.auth_env_telemetry.clone(),
+            );
+            let inference_trace_attempt = inference_trace.start_attempt();
+            inference_trace_attempt.record_started(&request.body);
+            let client =
+                ApiTamuChatClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+                    .with_telemetry(Some(request_telemetry));
+
+            match client.request(request.clone()).await {
+                Ok(stream) => {
+                    let (stream, _) = map_response_stream(
+                        stream,
+                        session_telemetry.clone(),
+                        inference_trace_attempt,
+                        Arc::clone(&self.client.state.provider),
+                    );
+                    return Ok(stream);
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    let response_debug_context =
+                        extract_response_debug_context(&unauthorized_transport);
+                    inference_trace_attempt.record_failed(
+                        &unauthorized_transport,
+                        response_debug_context.request_id.as_deref(),
+                        /*output_items*/ &[],
+                    );
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(
+                        handle_unauthorized(
+                            unauthorized_transport,
+                            &mut auth_recovery,
+                            session_telemetry,
+                            &self.client.state.provider,
+                        )
+                        .await?,
+                    );
+                }
+                Err(error) => {
+                    let response_debug_context =
+                        extract_response_debug_context_from_api_error(&error);
+                    let error = self.client.state.provider.map_api_error(error);
+                    inference_trace_attempt.record_failed(
+                        &error,
+                        response_debug_context.request_id.as_deref(),
+                        /*output_items*/ &[],
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     /// Streams a turn via the Responses API over WebSocket transport.
     #[allow(clippy::too_many_arguments)]
     #[instrument(
@@ -1820,6 +1930,10 @@ impl ModelClientSession {
                     inference_trace,
                 )
                 .await
+            }
+            WireApi::TamuChat => {
+                self.stream_tamu_chat(prompt, model_info, session_telemetry, inference_trace)
+                    .await
             }
         }
     }

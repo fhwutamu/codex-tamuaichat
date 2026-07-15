@@ -10,6 +10,7 @@ use codex_api::SharedAuthProvider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::OpenAiModelsManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_models_manager::manager::StaticModelsManager;
@@ -330,6 +331,9 @@ impl ModelProvider for ConfiguredModelProvider {
         codex_home: PathBuf,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
+        if self.info.wire_api == WireApi::TamuChat {
+            return self.models_manager_without_cache(config_model_catalog);
+        }
         match config_model_catalog {
             Some(model_catalog) => Arc::new(StaticModelsManager::new(
                 self.auth_manager.clone(),
@@ -353,6 +357,14 @@ impl ModelProvider for ConfiguredModelProvider {
         &self,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
+        if self.info.wire_api == WireApi::TamuChat {
+            let model_catalog =
+                config_model_catalog.unwrap_or_else(crate::tamu_ai_chat::static_model_catalog);
+            return Arc::new(StaticModelsManager::new(
+                self.auth_manager.clone(),
+                model_catalog,
+            ));
+        }
         match config_model_catalog {
             Some(model_catalog) => Arc::new(StaticModelsManager::new(
                 self.auth_manager.clone(),
@@ -383,6 +395,7 @@ mod tests {
     use codex_model_provider_info::ModelProviderAwsAuthInfo;
     use codex_model_provider_info::WireApi;
     use codex_model_provider_info::create_oss_provider_with_base_url;
+    use codex_models_manager::ModelsManagerConfig;
     use codex_models_manager::manager::RefreshStrategy;
     use codex_protocol::account::PlanType;
     use codex_protocol::config_types::ModelProviderAuthInfo;
@@ -751,6 +764,50 @@ mod tests {
             .expect("Bedrock catalog should have a default model");
 
         assert_eq!(default_model.model, "openai.gpt-5.6-sol");
+    }
+
+    #[tokio::test]
+    async fn tamu_provider_exposes_its_models_in_the_picker() {
+        let provider = create_model_provider(
+            ModelProviderInfo::create_tamu_ai_chat_provider(),
+            /*auth_manager*/ None,
+        );
+        let manager =
+            provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
+        let models = manager
+            .list_models(
+                RefreshStrategy::Online,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await;
+
+        assert_eq!(models.len(), 32);
+        assert!(models.iter().all(|model| model.show_in_picker));
+        assert!(
+            models
+                .iter()
+                .all(|model| !model.model.starts_with("protected."))
+        );
+        assert!(!models.iter().any(|model| model.model.contains("embedding")));
+        assert!(
+            models
+                .iter()
+                .any(|model| model.model == "Claude Sonnet 4.6")
+        );
+        assert!(models.iter().any(|model| model.model == "gemini-3.5-flash"));
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| model.is_default)
+                .map(|model| model.model.as_str()),
+            Some("gpt-5.4")
+        );
+
+        let claude = manager
+            .get_model_info("Claude Sonnet 4.6", &ModelsManagerConfig::default())
+            .await;
+        assert!(!claude.used_fallback_model_metadata);
+        assert_eq!(claude.display_name, "Claude Sonnet 4.6");
     }
 
     #[tokio::test]

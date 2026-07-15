@@ -87,6 +87,33 @@ pub fn create_tools_json_for_responses_api(
     Ok(tools_json)
 }
 
+/// Returns function tools in the shape accepted by TAMU AI Chat's Chat Completions endpoint.
+///
+/// Chat Completions has no equivalents for Responses API namespace, hosted, or freeform tools,
+/// so those tools are intentionally omitted.
+pub fn create_tools_json_for_tamu_chat_api(
+    tools: &[ToolSpec],
+) -> Result<Vec<Value>, serde_json::Error> {
+    tools
+        .iter()
+        .filter_map(|tool| match tool {
+            ToolSpec::Function(function) => {
+                let mut function = function.clone();
+                function.defer_loading = None;
+                Some(
+                    serde_json::to_value(function).map(
+                        |function| serde_json::json!({"type": "function", "function": function}),
+                    ),
+                )
+            }
+            ToolSpec::Namespace(_)
+            | ToolSpec::ToolSearch { .. }
+            | ToolSpec::WebSearch { .. }
+            | ToolSpec::Freeform(_) => None,
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ResponsesApiWebSearchFilters {
     #[serde(skip_serializing_if = "Option::is_none")]
