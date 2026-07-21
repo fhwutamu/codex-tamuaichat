@@ -1,0 +1,299 @@
+name: tamu-release
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/tamu-release.yml"
+      - "codex-rs/**"
+      - "README.md"
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_PROFILE_RELEASE_DEBUG: "none"
+  CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+  CARGO_PROFILE_RELEASE_STRIP: "symbols"
+
+jobs:
+  build-unix:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Use a clean Cargo home for musl
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
+          mkdir -p "${cargo_home}/bin"
+          echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
+          echo "${cargo_home}/bin" >> "$GITHUB_PATH"
+          : > "${cargo_home}/config.toml"
+
+      - name: Install Zig for musl
+        if: ${{ runner.os == 'Linux' }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.0
+          use-cache: false
+
+      - name: Install musl build tools
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+
+      - name: Disable aws-lc jitter entropy for musl
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
+          target_var="AWS_LC_SYS_NO_JITTER_ENTROPY_${{ matrix.target }}"
+          target_var="${target_var//-/_}"
+          echo "${target_var}=1" >> "$GITHUB_ENV"
+
+      - name: Configure rusty_v8 release artifacts
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build bundled bubblewrap
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          cargo build --locked --target "$target" --release --bin bwrap
+          bwrap_path="target/${target}/release/bwrap"
+          strip --strip-debug --strip-unneeded "$bwrap_path"
+          digest="$(sha256sum "$bwrap_path" | awk '{print $1}')"
+          echo "CODEX_BWRAP_SHA256=${digest}" >> "$GITHUB_ENV"
+
+      - name: Build Codex
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --target "${{ matrix.target }}" --release --bin codex
+
+      - name: Package and smoke-test Unix artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          release_dir="target/${target}/release"
+          stage_dir="${RUNNER_TEMP}/codex-${target}"
+          dist_dir="dist/${target}"
+          archive="${dist_dir}/codex-${target}.tar.gz"
+
+          rm -rf "$stage_dir"
+          mkdir -p "$stage_dir" "$dist_dir"
+          cp "${release_dir}/codex" "$stage_dir/codex"
+
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            mkdir -p "$stage_dir/codex-resources"
+            cp "${release_dir}/bwrap" "$stage_dir/codex-resources/bwrap"
+            chmod 0755 "$stage_dir/codex" "$stage_dir/codex-resources/bwrap"
+
+            if readelf -d "$stage_dir/codex" | grep -q '(NEEDED)'; then
+              echo "Linux release unexpectedly contains dynamic dependencies" >&2
+              readelf -d "$stage_dir/codex" >&2
+              exit 1
+            fi
+
+            "$stage_dir/codex" --version
+            tar -C "$stage_dir" -czf "$archive" codex codex-resources/bwrap
+          else
+            chmod 0755 "$stage_dir/codex"
+            codesign --force --sign - "$stage_dir/codex"
+            codesign --verify --verbose "$stage_dir/codex"
+            "$stage_dir/codex" --version
+            tar -C "$stage_dir" -czf "$archive" codex
+          fi
+
+          ls -lh "$archive"
+
+      - name: Upload Unix release artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release-${{ matrix.target }}
+          path: codex-rs/dist/${{ matrix.target }}/codex-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-ci
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Configure MSVC environment
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build Codex and Windows sandbox helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          if [[ "$target" == "x86_64-pc-windows-msvc" ]]; then
+            export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          fi
+          cargo build \
+            --locked \
+            --target "$target" \
+            --release \
+            --bin codex \
+            --bin codex-command-runner \
+            --bin codex-windows-sandbox-setup
+
+      - name: Package and smoke-test Windows artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = "${{ matrix.target }}"
+          $releaseDir = Join-Path $env:CARGO_TARGET_DIR "$target/release"
+          $stageDir = Join-Path $env:RUNNER_TEMP "codex-$target"
+          $distDir = Join-Path $env:GITHUB_WORKSPACE "codex-rs/dist/$target"
+          $archive = Join-Path $distDir "codex-$target.zip"
+
+          Remove-Item -Recurse -Force $stageDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stageDir, $distDir | Out-Null
+          Copy-Item (Join-Path $releaseDir "codex.exe") $stageDir
+          Copy-Item (Join-Path $releaseDir "codex-command-runner.exe") $stageDir
+          Copy-Item (Join-Path $releaseDir "codex-windows-sandbox-setup.exe") $stageDir
+
+          & (Join-Path $stageDir "codex.exe") --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "codex.exe smoke test failed with exit code $LASTEXITCODE"
+          }
+
+          Compress-Archive -Path "$stageDir/*" -DestinationPath $archive -CompressionLevel Optimal -Force
+          Get-Item $archive | Format-List FullName, Length
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release-${{ matrix.target }}
+          path: codex-rs/dist/${{ matrix.target }}/codex-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  checksums:
+    name: Assemble release files
+    needs:
+      - build-unix
+      - build-windows
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-dist
+
+      - name: Generate and verify SHA256SUMS
+        shell: bash
+        working-directory: release-dist
+        run: |
+          set -euo pipefail
+          asset_count="$(find . -maxdepth 1 -type f -name 'codex-*' | wc -l)"
+          if [[ "$asset_count" -ne 6 ]]; then
+            echo "Expected 6 release archives, found ${asset_count}" >&2
+            find . -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+          sha256sum codex-* > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -lh
+
+      - name: Upload complete release set
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release-files
+          path: release-dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: checksums
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download complete release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-files
+          path: release-dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" release-dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "codex-tamuaichat ${GITHUB_REF_NAME}" \
+            --generate-notes
